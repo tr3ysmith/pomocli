@@ -20,7 +20,7 @@ use winit::event_loop::{EventLoop, ControlFlow};
 #[command(version = "0.1.0")]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -48,12 +48,6 @@ enum Commands {
     },
     /// Test the notification sound
     TestSound,
-    /// Start timer with system tray integration
-    TrayTimer {
-        /// Duration in minutes
-        #[arg(value_name = "MINUTES")]
-        minutes: u32,
-    },
 }
 
 #[tokio::main]
@@ -61,18 +55,26 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Start {
+        Some(Commands::Start {
             work,
             short_break,
             long_break,
             cycles,
-        } => {
-            start_pomodoro_session(work, short_break, long_break, cycles).await?;
+        }) => {
+            if cfg!(target_os = "macos") {
+                start_tray_pomodoro_session(work, short_break, long_break, cycles).await?;
+            } else {
+                start_pomodoro_session(work, short_break, long_break, cycles).await?;
+            }
         }
-        Commands::Timer { minutes } => {
-            start_timer(minutes, "Timer").await?;
+        Some(Commands::Timer { minutes }) => {
+            if cfg!(target_os = "macos") {
+                start_tray_timer(minutes, "timer").await?;
+            } else {
+                start_timer(minutes, "Timer").await?;
+            }
         }
-        Commands::TestSound => {
+        Some(Commands::TestSound) => {
             println!(
                 "{}",
                 "🔊 Testing notification sound...".bright_cyan().bold()
@@ -80,8 +82,13 @@ async fn main() -> Result<()> {
             play_notification_sound().await;
             println!("{}", "Sound test complete!".bright_green());
         }
-        Commands::TrayTimer { minutes } => {
-            start_tray_timer(minutes).await?;
+        None => {
+            // Default to start command with default values
+            if cfg!(target_os = "macos") {
+                start_tray_pomodoro_session(25, 5, 15, 4).await?;
+            } else {
+                start_pomodoro_session(25, 5, 15, 4).await?;
+            }
         }
     }
 
@@ -258,68 +265,149 @@ async fn play_notification_sound() {
     .ok();
 }
 
-async fn start_tray_timer(minutes: u32) -> Result<()> {
-    println!("{}", format!("🍅 Starting {}-minute timer with system tray...", minutes).bright_red().bold());
+async fn start_tray_timer(minutes: u32, timer_type: &str) -> Result<()> {
+    let (emoji, phase_name) = match timer_type {
+        "work" => ("🔥", "Work"),
+        "break" => ("☕", "Break"),
+        "longbreak" => ("😴", "Long Break"),
+        _ => ("⏰", "Timer"),
+    };
+    
     
     // Create event loop for tray
     let event_loop = EventLoop::new().unwrap();
     
     // Create tray icon
     let tray_icon = TrayIconBuilder::new()
-        .with_title(format!("⏰ {}:00", minutes))
+        .with_title(format!("{} {}:00", emoji, minutes))
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to create tray icon: {}", e))?;
     
     let total_seconds = minutes * 60;
     let start_time = Instant::now();
     
-    println!("{}", "Timer running in system tray. Check the top of your screen!".bright_green());
-    println!("{}", "Press Ctrl+C to stop the timer.".dim());
+    // Create progress bar
+    let pb = ProgressBar::new(total_seconds as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>7}/{len:7} {msg}")
+            .unwrap()
+            .progress_chars("██▌ "),
+    );
+    pb.set_message(format!("{} {} - {}min", emoji, phase_name, minutes));
+    
     
     // Run event loop with timer updates
-    let mut last_update = Instant::now();
+    let mut last_progress_update = Instant::now();
+    let mut last_tray_update = Instant::now();
+    
     event_loop.run(move |_event, elwt| {
         elwt.set_control_flow(ControlFlow::Poll);
         
-        // Update every second
-        if last_update.elapsed() >= Duration::from_secs(1) {
-            let elapsed = start_time.elapsed();
-            let total_duration = Duration::from_secs(total_seconds as u64);
+        let now = Instant::now();
+        let elapsed = start_time.elapsed();
+        let total_duration = Duration::from_secs(total_seconds as u64);
+        
+        if elapsed >= total_duration {
+            // Timer complete
+            let _ = tray_icon.set_title(Some("✅ Complete!"));
+            pb.finish_with_message(format!("{} {} - Complete! ✅", emoji, phase_name));
             
-            if elapsed >= total_duration {
-                // Timer complete
-                let _ = tray_icon.set_title(Some("✅ Complete!"));
-                
-                // Play sound in a blocking thread
-                std::thread::spawn(|| {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        play_notification_sound().await;
-                    });
+            // Play sound in a blocking thread
+            std::thread::spawn(|| {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    play_notification_sound().await;
                 });
-                
-                // Exit after a short delay
-                std::thread::spawn(|| {
-                    std::thread::sleep(Duration::from_secs(3));
-                    std::process::exit(0);
-                });
+            });
+            
+            // Brief pause then exit
+            std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_secs(2));
+                std::process::exit(0);
+            });
+            return;
+        }
+        
+        let remaining = total_duration - elapsed;
+        let minutes_left = remaining.as_secs() / 60;
+        let seconds_left = remaining.as_secs() % 60;
+        let elapsed_seconds = elapsed.as_secs();
+        
+        // Update progress bar every 100ms
+        if now.duration_since(last_progress_update) >= Duration::from_millis(100) {
+            pb.set_position(elapsed_seconds);
+            pb.set_message(format!(
+                "{} {} - {}:{:02} remaining",
+                emoji,
+                phase_name,
+                minutes_left,
+                seconds_left
+            ));
+            last_progress_update = now;
+        }
+        
+        // Update tray every second
+        if now.duration_since(last_tray_update) >= Duration::from_secs(1) {
+            let title = if remaining.as_secs() < 60 {
+                format!("{} 0:{:02}", emoji, seconds_left)
             } else {
-                let remaining = total_duration - elapsed;
-                let minutes_left = remaining.as_secs() / 60;
-                let seconds_left = remaining.as_secs() % 60;
-                
-                let title = if remaining.as_secs() < 60 {
-                    format!("⏰ 0:{:02}", seconds_left)
-                } else {
-                    format!("⏰ {}:{:02}", minutes_left, seconds_left)
-                };
-                
-                let _ = tray_icon.set_title(Some(&title));
-            }
-            
-            last_update = Instant::now();
+                format!("{} {}:{:02}", emoji, minutes_left, seconds_left)
+            };
+            let _ = tray_icon.set_title(Some(&title));
+            last_tray_update = now;
         }
     }).map_err(|e| anyhow::anyhow!("Event loop error: {}", e))?;
     
+    Ok(())
+}
+
+async fn start_tray_pomodoro_session(
+    work_minutes: u32,
+    short_break_minutes: u32,
+    long_break_minutes: u32,
+    cycles: u32,
+) -> Result<()> {
+    println!("{}", "🍅 Pomodoro Session Starting!".bright_red().bold());
+    println!(
+        "Work: {}min | Short Break: {}min | Long Break: {}min | Cycles: {}",
+        work_minutes.to_string().cyan(),
+        short_break_minutes.to_string().green(),
+        long_break_minutes.to_string().blue(),
+        cycles.to_string().yellow()
+    );
+    println!();
+
+    for cycle in 1..=cycles {
+        // Work period
+        println!(
+            "{} {} (Cycle {}/{})",
+            "🔥".bright_red(),
+            "WORK TIME".bright_red().bold(),
+            cycle.to_string().yellow(),
+            cycles.to_string().yellow()
+        );
+        start_tray_timer(work_minutes, "work").await?;
+
+        if cycle < cycles {
+            // Short break
+            println!(
+                "{} {}",
+                "☕".bright_green(),
+                "SHORT BREAK".bright_green().bold()
+            );
+            start_tray_timer(short_break_minutes, "break").await?;
+        }
+    }
+
+    // Long break after all cycles
+    println!(
+        "{} {}",
+        "😴".bright_blue(),
+        "LONG BREAK - You earned it!".bright_blue().bold()
+    );
+    start_tray_timer(long_break_minutes, "longbreak").await?;
+
+    println!("{}", "🎊 Pomodoro session complete! Great work!".bright_magenta().bold());
     Ok(())
 }
