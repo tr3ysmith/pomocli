@@ -11,6 +11,8 @@ use rodio::{Decoder, OutputStream, Sink};
 use std::io::{Cursor, stdout};
 use std::time::Duration;
 use tokio::time::{Instant, sleep};
+use tray_icon::TrayIconBuilder;
+use winit::event_loop::{EventLoop, ControlFlow};
 
 #[derive(Parser)]
 #[command(name = "pomocli")]
@@ -46,6 +48,12 @@ enum Commands {
     },
     /// Test the notification sound
     TestSound,
+    /// Start timer with system tray integration
+    TrayTimer {
+        /// Duration in minutes
+        #[arg(value_name = "MINUTES")]
+        minutes: u32,
+    },
 }
 
 #[tokio::main]
@@ -71,6 +79,9 @@ async fn main() -> Result<()> {
             );
             play_notification_sound().await;
             println!("{}", "Sound test complete!".bright_green());
+        }
+        Commands::TrayTimer { minutes } => {
+            start_tray_timer(minutes).await?;
         }
     }
 
@@ -245,4 +256,70 @@ async fn play_notification_sound() {
     })
     .await
     .ok();
+}
+
+async fn start_tray_timer(minutes: u32) -> Result<()> {
+    println!("{}", format!("🍅 Starting {}-minute timer with system tray...", minutes).bright_red().bold());
+    
+    // Create event loop for tray
+    let event_loop = EventLoop::new().unwrap();
+    
+    // Create tray icon
+    let tray_icon = TrayIconBuilder::new()
+        .with_title(format!("⏰ {}:00", minutes))
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to create tray icon: {}", e))?;
+    
+    let total_seconds = minutes * 60;
+    let start_time = Instant::now();
+    
+    println!("{}", "Timer running in system tray. Check the top of your screen!".bright_green());
+    println!("{}", "Press Ctrl+C to stop the timer.".dim());
+    
+    // Run event loop with timer updates
+    let mut last_update = Instant::now();
+    event_loop.run(move |_event, elwt| {
+        elwt.set_control_flow(ControlFlow::Poll);
+        
+        // Update every second
+        if last_update.elapsed() >= Duration::from_secs(1) {
+            let elapsed = start_time.elapsed();
+            let total_duration = Duration::from_secs(total_seconds as u64);
+            
+            if elapsed >= total_duration {
+                // Timer complete
+                let _ = tray_icon.set_title(Some("✅ Complete!"));
+                
+                // Play sound in a blocking thread
+                std::thread::spawn(|| {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        play_notification_sound().await;
+                    });
+                });
+                
+                // Exit after a short delay
+                std::thread::spawn(|| {
+                    std::thread::sleep(Duration::from_secs(3));
+                    std::process::exit(0);
+                });
+            } else {
+                let remaining = total_duration - elapsed;
+                let minutes_left = remaining.as_secs() / 60;
+                let seconds_left = remaining.as_secs() % 60;
+                
+                let title = if remaining.as_secs() < 60 {
+                    format!("⏰ 0:{:02}", seconds_left)
+                } else {
+                    format!("⏰ {}:{:02}", minutes_left, seconds_left)
+                };
+                
+                let _ = tray_icon.set_title(Some(&title));
+            }
+            
+            last_update = Instant::now();
+        }
+    }).map_err(|e| anyhow::anyhow!("Event loop error: {}", e))?;
+    
+    Ok(())
 }
