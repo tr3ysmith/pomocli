@@ -12,7 +12,7 @@ use std::io::{Cursor, stdout};
 use std::time::Duration;
 use tokio::time::{Instant, sleep};
 use tray_icon::TrayIconBuilder;
-use winit::event_loop::{EventLoop, ControlFlow};
+use winit::event_loop::{ControlFlow, EventLoop};
 
 #[derive(Parser)]
 #[command(name = "pomocli")]
@@ -272,93 +272,216 @@ async fn start_tray_timer(minutes: u32, timer_type: &str) -> Result<()> {
         "longbreak" => ("😴", "Long Break"),
         _ => ("⏰", "Timer"),
     };
-    
-    
+
     // Create event loop for tray
     let event_loop = EventLoop::new().unwrap();
-    
+
     // Create tray icon
     let tray_icon = TrayIconBuilder::new()
         .with_title(format!("{} {}:00", emoji, minutes))
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to create tray icon: {}", e))?;
-    
+
     let total_seconds = minutes * 60;
     let start_time = Instant::now();
-    
+
     // Create progress bar
     let pb = ProgressBar::new(total_seconds as u64);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>7}/{len:7} {msg}")
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>7}/{len:7} {msg}",
+            )
             .unwrap()
             .progress_chars("██▌ "),
     );
     pb.set_message(format!("{} {} - {}min", emoji, phase_name, minutes));
-    
-    
+
     // Run event loop with timer updates
     let mut last_progress_update = Instant::now();
     let mut last_tray_update = Instant::now();
+    let mut timer_complete = false;
+
+    event_loop
+        .run(move |_event, elwt| {
+            elwt.set_control_flow(ControlFlow::Poll);
+
+            let now = Instant::now();
+            let elapsed = start_time.elapsed();
+            let total_duration = Duration::from_secs(total_seconds as u64);
+
+            if elapsed >= total_duration && !timer_complete {
+                // Timer complete
+                timer_complete = true;
+                let _ = tray_icon.set_title(Some("✅ Complete!"));
+                pb.finish_with_message(format!("{} {} - Complete! ✅", emoji, phase_name));
+
+                // Play sound asynchronously (fire and forget)
+                tokio::spawn(play_notification_sound());
+
+                // Exit immediately after completion
+                elwt.exit();
+                return;
+            }
+
+            if timer_complete {
+                return;
+            }
+
+            let remaining = total_duration - elapsed;
+            let minutes_left = remaining.as_secs() / 60;
+            let seconds_left = remaining.as_secs() % 60;
+            let elapsed_seconds = elapsed.as_secs();
+
+            // Update progress bar every 100ms
+            if now.duration_since(last_progress_update) >= Duration::from_millis(100) {
+                pb.set_position(elapsed_seconds);
+                pb.set_message(format!(
+                    "{} {} - {}:{:02} remaining",
+                    emoji, phase_name, minutes_left, seconds_left
+                ));
+                last_progress_update = now;
+            }
+
+            // Update tray every second
+            if now.duration_since(last_tray_update) >= Duration::from_secs(1) {
+                let title = if remaining.as_secs() < 60 {
+                    format!("{} 0:{:02}", phase_name, seconds_left)
+                } else {
+                    format!("{} {}:{:02}", phase_name, minutes_left, seconds_left)
+                };
+                let _ = tray_icon.set_title(Some(&title));
+                last_tray_update = now;
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("Event loop error: {}", e))?;
+
+    Ok(())
+}
+
+async fn run_complete_tray_session(
+    phases: Vec<(u32, &str, String)>,
+    tray_icon: &tray_icon::TrayIcon,
+    event_loop: EventLoop<()>,
+) -> Result<()> {
+    let mut current_phase = 0;
+    let mut phase_start_time = Instant::now();
+    let mut last_progress_update = Instant::now();
+    let mut last_tray_update = Instant::now();
+    let mut phase_complete = false;
+    let mut session_complete = false;
     
-    event_loop.run(move |_event, elwt| {
-        elwt.set_control_flow(ControlFlow::Poll);
-        
-        let now = Instant::now();
-        let elapsed = start_time.elapsed();
-        let total_duration = Duration::from_secs(total_seconds as u64);
-        
-        if elapsed >= total_duration {
-            // Timer complete
-            let _ = tray_icon.set_title(Some("✅ Complete!"));
-            pb.finish_with_message(format!("{} {} - Complete! ✅", emoji, phase_name));
-            
-            // Play sound in a blocking thread
-            std::thread::spawn(|| {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    play_notification_sound().await;
+    // Create progress bar for the current phase
+    let mut pb = ProgressBar::new(0);
+    
+    // Initialize progress bar for first phase
+    if !phases.is_empty() {
+        let (minutes, _timer_type, phase_name) = &phases[0];
+        pb = ProgressBar::new((minutes * 60) as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>7}/{len:7} {msg}",
+                )
+                .unwrap()
+                .progress_chars("██▌ "),
+        );
+        pb.set_message(phase_name.clone());
+    }
+
+    event_loop
+        .run(move |_event, elwt| {
+            elwt.set_control_flow(ControlFlow::Poll);
+
+            if session_complete {
+                return;
+            }
+
+            if current_phase >= phases.len() {
+                // Session complete
+                session_complete = true;
+                let _ = tray_icon.set_title(Some("🎊 Session Complete!"));
+                tokio::spawn(play_notification_sound());
+                elwt.exit();
+                return;
+            }
+
+            let (minutes, _timer_type, phase_name) = &phases[current_phase];
+
+            let total_seconds = minutes * 60;
+            let total_duration = Duration::from_secs(total_seconds as u64);
+            let now = Instant::now();
+            let elapsed = phase_start_time.elapsed();
+
+            if elapsed >= total_duration && !phase_complete {
+                // Phase complete
+                phase_complete = true;
+                let _ = tray_icon.set_title(Some("✅ Phase Complete!"));
+
+                // Play sound asynchronously
+                tokio::spawn(play_notification_sound());
+
+                // Move to next phase after a brief pause
+                tokio::spawn(async {
+                    sleep(Duration::from_secs(2)).await;
+                    // This will be handled by the next iteration
                 });
-            });
-            
-            // Brief pause then exit
-            std::thread::spawn(|| {
-                std::thread::sleep(Duration::from_secs(2));
-                std::process::exit(0);
-            });
-            return;
-        }
-        
-        let remaining = total_duration - elapsed;
-        let minutes_left = remaining.as_secs() / 60;
-        let seconds_left = remaining.as_secs() % 60;
-        let elapsed_seconds = elapsed.as_secs();
-        
-        // Update progress bar every 100ms
-        if now.duration_since(last_progress_update) >= Duration::from_millis(100) {
-            pb.set_position(elapsed_seconds);
-            pb.set_message(format!(
-                "{} {} - {}:{:02} remaining",
-                emoji,
-                phase_name,
-                minutes_left,
-                seconds_left
-            ));
-            last_progress_update = now;
-        }
-        
-        // Update tray every second
-        if now.duration_since(last_tray_update) >= Duration::from_secs(1) {
-            let title = if remaining.as_secs() < 60 {
-                format!("{} 0:{:02}", emoji, seconds_left)
-            } else {
-                format!("{} {}:{:02}", emoji, minutes_left, seconds_left)
-            };
-            let _ = tray_icon.set_title(Some(&title));
-            last_tray_update = now;
-        }
-    }).map_err(|e| anyhow::anyhow!("Event loop error: {}", e))?;
-    
+                return;
+            }
+
+            if phase_complete {
+                // Move to next phase
+                current_phase += 1;
+                phase_start_time = Instant::now();
+                phase_complete = false;
+                last_progress_update = Instant::now();
+                last_tray_update = Instant::now();
+                
+                // Initialize progress bar for new phase
+                if current_phase < phases.len() {
+                    let (minutes, _timer_type, phase_name) = &phases[current_phase];
+                    pb = ProgressBar::new((minutes * 60) as u64);
+                    pb.set_style(
+                        ProgressStyle::default_bar()
+                            .template(
+                                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>7}/{len:7} {msg}",
+                            )
+                            .unwrap()
+                            .progress_chars("██▌ "),
+                    );
+                    pb.set_message(phase_name.clone());
+                }
+                return;
+            }
+
+            let remaining = total_duration - elapsed;
+            let minutes_left = remaining.as_secs() / 60;
+            let seconds_left = remaining.as_secs() % 60;
+
+            // Update progress bar every 100ms
+            if now.duration_since(last_progress_update) >= Duration::from_millis(100) {
+                let elapsed_seconds = elapsed.as_secs();
+                pb.set_position(elapsed_seconds);
+                pb.set_message(format!(
+                    "{} - {}:{:02} remaining",
+                    phase_name, minutes_left, seconds_left
+                ));
+                last_progress_update = now;
+            }
+
+            // Update tray every second
+            if now.duration_since(last_tray_update) >= Duration::from_secs(1) {
+                let title = if remaining.as_secs() < 60 {
+                    format!("{} 0:{:02}", phase_name, seconds_left)
+                } else {
+                    format!("{} {}:{:02}", phase_name, minutes_left, seconds_left)
+                };
+                let _ = tray_icon.set_title(Some(&title));
+                last_tray_update = now;
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("Event loop error: {}", e))?;
+
     Ok(())
 }
 
@@ -378,36 +501,45 @@ async fn start_tray_pomodoro_session(
     );
     println!();
 
+    // Create event loop and tray icon once for the entire session
+    let event_loop = EventLoop::new().unwrap();
+    let tray_icon = TrayIconBuilder::new()
+        .with_title("🍅 Pomodoro Session")
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to create tray icon: {}", e))?;
+
+    // Build the complete session schedule
+    let mut session_phases = Vec::new();
+
     for cycle in 1..=cycles {
         // Work period
-        println!(
-            "{} {} (Cycle {}/{})",
-            "🔥".bright_red(),
-            "WORK TIME".bright_red().bold(),
-            cycle.to_string().yellow(),
-            cycles.to_string().yellow()
-        );
-        start_tray_timer(work_minutes, "work").await?;
+        session_phases.push((
+            work_minutes,
+            "work",
+            format!("🔥 Work (Cycle {}/{})", cycle, cycles),
+        ));
 
         if cycle < cycles {
             // Short break
-            println!(
-                "{} {}",
-                "☕".bright_green(),
-                "SHORT BREAK".bright_green().bold()
-            );
-            start_tray_timer(short_break_minutes, "break").await?;
+            session_phases.push((short_break_minutes, "break", "☕ Short Break".to_string()));
         }
     }
 
     // Long break after all cycles
-    println!(
-        "{} {}",
-        "😴".bright_blue(),
-        "LONG BREAK - You earned it!".bright_blue().bold()
-    );
-    start_tray_timer(long_break_minutes, "longbreak").await?;
+    session_phases.push((
+        long_break_minutes,
+        "longbreak",
+        "😴 Long Break - You earned it!".to_string(),
+    ));
 
-    println!("{}", "🎊 Pomodoro session complete! Great work!".bright_magenta().bold());
+    // Run the complete session in one event loop
+    run_complete_tray_session(session_phases, &tray_icon, event_loop).await?;
+
+    println!(
+        "{}",
+        "🎊 Pomodoro session complete! Great work!"
+            .bright_magenta()
+            .bold()
+    );
     Ok(())
 }
