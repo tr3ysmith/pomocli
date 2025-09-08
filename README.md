@@ -1,6 +1,6 @@
 # 🍅 PomoCLI
 
-A beautiful, cross-platform pomodoro timer built for developers who live in the terminal.
+A simple, clean pomodoro timer built for developers who live in the terminal.
 
 ## ✨ Features
 
@@ -170,11 +170,11 @@ Contributions welcome! Please feel free to:
 
 ## 📄 License
 
-MIT License - see LICENSE file for details.
+GPL-3.0 License - see LICENSE file for details.
 
 ## 🙏 Acknowledgments
 
-Inspired by the Pomodoro Technique® developed by Francesco Cirillo. Built for developers who appreciate beautiful terminal applications.
+Inspired by the Pomodoro Technique® developed by Francesco Cirillo. Built for developers who want a simple, distraction-free productivity tool.
 
 ---
 

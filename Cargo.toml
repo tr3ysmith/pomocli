@@ -1,8 +1,14 @@
 [package]
 name = "pomocli"
-description = "A simple cli pomodoro timer for developers"
+description = "A simple, clean pomodoro timer for developers"
 version = "0.1.0"
 edition = "2024"
+license = "GPL-3.0"
+authors = ["Trey Smith"]
+repository = "https://github.com/tr3ysmith/pomocli"
+homepage = "https://github.com/tr3ysmith/pomocli"
+keywords = ["pomodoro", "timer", "productivity", "cli", "terminal"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 clap = { version = "4.4", features = ["derive"] }
